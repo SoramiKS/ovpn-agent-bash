@@ -3,9 +3,9 @@
 # deploymentovpn.sh (Simplified Version - Systemd & No SNMP)
 #
 # This script automates the deployment of the OpenVPN Agent on a new server.
-# It will install dependencies, create a Python virtual environment (venv),
-# deploy the agent and client manager scripts, and configure them to
-# run as a systemd service.
+# It will clean up old PM2-based installations, install dependencies,
+# create a Python virtual environment (venv), deploy the agent and
+# client manager scripts, and configure them to run as a systemd service.
 #
 # Usage: sudo ./deploymentovpn.sh
 #
@@ -165,6 +165,77 @@ get_user_input() {
         CPU_RAM_INTERVAL=60
     fi
 }
+
+# --- NEW: Function to Clean Up Old PM2-based Installations ---
+cleanup_old_pm2_installation() {
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo "🧹 CLEANING UP OLD PM2-BASED AGENT INSTALLATION"
+    echo "═══════════════════════════════════════════════"
+    echo ""
+
+    # Check for PM2 and remove it
+    if command -v pm2 &> /dev/null; then
+        echo "[-] Found old PM2 installation. Stopping and removing processes..."
+        pm2 stop all >/dev/null 2>&1 || true
+        pm2 delete all >/dev/null 2>&1 || true
+        pm2 kill >/dev/null 2>&1 || true
+        
+        echo "[-] Uninstalling PM2 globally..."
+        # Source nvm if it exists to find npm
+        export NVM_DIR="/root/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        
+        if command -v npm &> /dev/null; then
+            npm uninstall -g pm2 >/dev/null 2>&1 || true
+            echo "✅ PM2 uninstalled."
+        else
+            echo "⚠️  npm not found, cannot uninstall PM2 automatically. Skipping."
+        fi
+        
+        echo "[-] Removing PM2 startup scripts..."
+        pm2 unstartup >/dev/null 2>&1 || true
+
+        echo "[-] Removing PM2 home directory..."
+        rm -rf "/root/.pm2"
+    else
+        echo "✅ No PM2 installation found. Skipping PM2 cleanup."
+    fi
+
+    # Check for NVM and remove it
+    if [ -d "/root/.nvm" ]; then
+        echo "[-] Found old NVM installation. Removing..."
+        # Unload nvm
+        command -v nvm &> /dev/null && nvm unload || true
+        # Remove NVM directory
+        rm -rf "/root/.nvm"
+        # Clean up shell configuration files for root
+        sed -i '/NVM_DIR/d' "/root/.bashrc" "/root/.profile" >/dev/null 2>&1 || true
+        sed -i '/nvm.sh/d' "/root/.bashrc" "/root/.profile" >/dev/null 2>&1 || true
+        echo "✅ NVM and Node.js removed."
+    else
+        echo "✅ No NVM installation found. Skipping NVM cleanup."
+    fi
+
+    # Remove symlinks that might be left over
+    echo "[-] Removing old symlinks..."
+    rm -f /usr/local/bin/node
+    rm -f /usr/local/bin/pm2
+    echo "✅ Symlinks removed."
+
+    # Remove snmpd if installed
+    if dpkg -l | grep -q "snmpd"; then
+        echo "[-] Found old snmpd package. Removing..."
+        apt-get purge --auto-remove -y snmpd >/dev/null 2>&1
+        echo "✅ snmpd package removed."
+    else
+        echo "✅ No snmpd package found. Skipping."
+    fi
+
+    echo ""
+    echo "✅ OLD INSTALLATION CLEANUP COMPLETE"
+}
+
 
 # Find the Easy-RSA index.txt path dynamically
 find_easy_rsa_path() {
@@ -641,7 +712,7 @@ async def background_task_loop():
                 #print(f"Sent status report for server {SERVER_ID} (CPU: {cpu_usage}%, RAM: {ram_usage}%)")
             else:
                 #print(f"Sent basic status report for server {SERVER_ID} (CPU/RAM disabled)")
-
+                pass
             await asyncio.to_thread(
                 requests.post, f"{DASHBOARD_API_URL}/agent/report-status", json=node_metrics_payload, headers=headers, timeout=10
             )
@@ -656,6 +727,7 @@ async def background_task_loop():
                 last_vpn_profiles_checksum = current_profiles_checksum
             else:
                 #print(f"VPN profiles checksum unchanged for server {SERVER_ID}. Skipping sync.")
+                pass
             # 3. Sync User Activity Logs (on change)
             current_activity_logs, current_activity_checksum = parse_activity_logs()
             if current_activity_checksum and current_activity_checksum != last_activity_log_checksum:
@@ -670,6 +742,7 @@ async def background_task_loop():
                 last_activity_log_checksum = current_activity_checksum
             else:
                 #print(f"User activity log checksum unchanged for server {SERVER_ID}. Skipping sync.")
+                pass
             # 4. Process Pending Actions from Dashboard
             action_logs_response = await asyncio.to_thread(
                 requests.get, f"{DASHBOARD_API_URL}/agent/action-logs?serverId={SERVER_ID}", headers=headers, timeout=10
@@ -920,6 +993,108 @@ SELF_DESTRUCT_EOF
     echo "✅ ALL SCRIPTS DEPLOYED SUCCESSFULLY"
 }
 
+# --- Function: Setup OpenVPN Logrotate ---
+setup_openvpn_logrotate() {
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo "🔄 CONFIGURING LOG ROTATION FOR OPENVPN"
+    echo "═══════════════════════════════════════════════"
+    echo ""
+
+    local log_file="/var/log/openvpn/openvpn.log"
+    local rotate_conf_dir="/etc/logrotate.d"
+    local new_conf_file="$rotate_conf_dir/openvpn-log"
+
+    # Periksa apakah sudah ada file konfigurasi yang mengatur log ini
+    if grep -rq "$log_file" "$rotate_conf_dir"; then
+        echo "✅ Log rotation for $log_file seems to be already configured. Skipping."
+        return
+    fi
+
+    # Tanya pengguna
+    read -p "Do you want to set up log rotation for $log_file? [Y/n]: " choice
+    choice=${choice:-Y} # Default ke Y jika pengguna hanya menekan Enter
+
+    if [[ "$choice" =~ ^[yY]$ ]]; then
+        echo "📝 Creating logrotate configuration at $new_conf_file..."
+        
+        cat << 'EOF' | tee "$new_conf_file" > /dev/null
+/var/log/openvpn/openvpn.log {
+    # Rotasi setiap bulan
+    monthly
+
+    # Simpan 6 file log lama
+    rotate 6
+
+    # Lanjutkan meski file log tidak ditemukan
+    missingok
+
+    # Jangan rotasi jika file kosong
+    notifempty
+
+    # Kompres file log yang sudah dirotasi
+    compress
+    delaycompress
+
+    # Jalankan skrip post-rotasi hanya sekali
+    sharedscripts
+
+    # Beritahu OpenVPN untuk menggunakan file log baru setelah rotasi
+    postrotate
+        if [ -f /run/openvpn/server.pid ]; then
+            /bin/systemctl restart openvpn@server > /dev/null 2>&1 || true
+        fi
+    endscript
+}
+EOF
+        echo "✅ Logrotate configuration created successfully."
+    else
+        echo "⏩ Skipping logrotate setup."
+    fi
+}
+
+# --- NEW FUNCTION: Setup Agent Logrotate ---
+setup_agent_logrotate() {
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo "🔄 CONFIGURING LOG ROTATION FOR AGENT LOGS"
+    echo "═══════════════════════════════════════════════"
+    echo ""
+
+    local agent_log_path="$SCRIPT_DIR/logs"
+    local rotate_conf_dir="/etc/logrotate.d"
+    local new_conf_file="$rotate_conf_dir/openvpn-agent-logs"
+
+    if grep -rq "$agent_log_path" "$rotate_conf_dir"; then
+        echo "✅ Log rotation for agent logs in $agent_log_path seems to be already configured. Skipping."
+        return
+    fi
+    
+    echo "📝 Creating logrotate configuration for agent logs at $new_conf_file..."
+    
+    # Use a heredoc that expands variables to get the correct SCRIPT_DIR
+    cat << EOF | tee "$new_conf_file" > /dev/null
+$SCRIPT_DIR/logs/*.log {
+    # Rotasi setiap bulan
+    monthly
+
+    # Simpan 2 file log lama (2 bulan)
+    rotate 2
+
+    # Lanjutkan meski file log tidak ditemukan
+    missingok
+
+    # Jangan rotasi jika file kosong
+    notifempty
+
+    # Kompres file log yang sudah dirotasi
+    compress
+    delaycompress
+}
+EOF
+    echo "✅ Agent logrotate configuration created successfully."
+}
+
 # --- NEW FUNCTION: Create Systemd Service File ---
 create_systemd_service_file() {
     echo ""
@@ -1006,6 +1181,9 @@ main() {
 
     check_sudo
     get_user_input
+    
+    # --- NEW: Call the cleanup function before doing anything else ---
+    cleanup_old_pm2_installation
 
     ## VENV CHANGE: Create the script directory at the beginning
     echo ""
@@ -1051,13 +1229,13 @@ main() {
         fi
     fi
 
-    # Execute main functions
     install_dependencies
-    # SNMP functions have been removed
     create_env_file
     deploy_scripts
-    create_systemd_service_file # Replaces create_pm2_ecosystem_file
-    configure_systemd           # Replaces configure_pm2
+    create_systemd_service_file 
+    setup_openvpn_logrotate
+    setup_agent_logrotate
+    configure_systemd          
 
     echo ""
     echo "╔═══════════════════════════════════════════════╗"
@@ -1104,8 +1282,6 @@ main() {
     else
         echo "⚠️  Agent health check failed. Check logs with: journalctl -u $APP_NAME -n 50"
     fi
-
-
 }
 
 # Run the main function
